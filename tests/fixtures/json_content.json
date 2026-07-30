@@ -1,0 +1,9 @@
+{
+  "conversations": [
+    {
+      "messages": [
+        {"id": "1", "timestamp": 100, "type": "received", "sender": "+15550000001", "content": "line 1\nquoted \"value\" and slash \\", "total": 1, "multipart": false, "part_ids": []}
+      ]
+    }
+  ]
+}

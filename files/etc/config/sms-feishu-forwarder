@@ -1,0 +1,6 @@
+config settings 'settings'
+	option enabled '1'
+	option modem_section '2_1'
+	option poll_interval '10'
+	option settle_delay '0'
+	option state_path '/var/lib/sms-feishu-forwarder/seen.keys'

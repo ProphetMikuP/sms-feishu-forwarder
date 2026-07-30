@@ -1,0 +1,10 @@
+{
+  "conversations": [
+    {
+      "messages": [
+        {"id": "1", "timestamp": 100, "type": "received", "sender": "+15550000001", "content": "part one\npart two", "total": 2, "multipart": true, "part_ids": ["p1", "p2"]},
+        {"id": "2", "timestamp": 200, "type": "received", "sender": "+15550000002", "content": "after multipart", "total": 1, "multipart": false, "part_ids": []}
+      ]
+    }
+  ]
+}

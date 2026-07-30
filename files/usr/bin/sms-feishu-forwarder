@@ -223,7 +223,9 @@ message_complete()
 format_time()
 {
 	local ts="$1"
-	date -d "@$ts" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || printf '%s' "$ts"
+	# qmodem exposes modem wall-clock time encoded as an epoch-like value.
+	# Render it in UTC to avoid applying the router's +08:00 offset a second time.
+	date -u -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -r "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$ts"
 }
 
 build_card()
@@ -374,6 +376,15 @@ process_poll()
 	return "$rc"
 }
 
+interruptible_sleep()
+{
+	local remaining="$1"
+	while [ "$remaining" -gt 0 ] && [ "$RUNNING" -eq 1 ]; do
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+}
+
 usage()
 {
 	printf '%s\n' "usage: $PROG [--once|--seed]"
@@ -408,7 +419,7 @@ main()
 			while [ "$RUNNING" -eq 1 ]; do
 				process_poll || true
 				[ "$RUNNING" -eq 1 ] || break
-				sleep "$POLL_INTERVAL"
+				interruptible_sleep "$POLL_INTERVAL"
 			done
 			;;
 	esac

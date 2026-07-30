@@ -341,6 +341,8 @@ test_json_content_survives()
 	export TEST_FIXTURE="$ROOT/tests/fixtures/json_content.json"
 	run_forwarder --once
 	assert_eq "JSON newlines and quotes survive" "$(body_contents_json)" '["line 1\nquoted \"value\" and slash \\"]'
+	assert_eq "qmodem timestamp avoids double timezone offset" "$(jq -r '.card.elements[0].fields[0].text.content' "$TEST_BODIES")" "**接收时间**
+1970-01-01 00:01:40"
 }
 
 test_install_seed_failure_rolls_back_replaced_files()

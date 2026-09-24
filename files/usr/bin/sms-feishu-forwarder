@@ -485,9 +485,72 @@ count_online_devices()
 	' "$leases_path" 2>/dev/null || printf '未知'
 }
 
+normalize_ipv4()
+{
+	printf '%s\n' "$1" | awk -F/ '
+		{
+			n = split($1, octet, ".")
+			if (n != 4) exit 1
+			for (i = 1; i <= 4; i++) {
+				if (octet[i] !~ /^[0-9]+$/ || octet[i] + 0 > 255) exit 1
+			}
+			print $1
+		}
+	' 2>/dev/null
+}
+
+parse_mt5700m_monsc()
+{
+	awk -F, '
+		function clean(value) {
+			gsub(/[[:space:]\r\"]/, "", value)
+			return value
+		}
+		/^\^MONSC:/ {
+			sub(/^\^MONSC:[[:space:]]*/, "", $1)
+			rat = clean($1)
+			arfcn = clean($4)
+			if (rat ~ /^NR/) {
+				pci = clean($7); pci_max = 1007; arfcn_max = 3279165
+			} else if (rat ~ /^LTE/) {
+				pci = clean($6); pci_max = 503; arfcn_max = 262143
+			} else {
+				exit 1
+			}
+			if (pci !~ /^[0-9]+$/ || arfcn !~ /^[0-9]+$/) exit 1
+			if (pci + 0 > pci_max || arfcn + 0 > arfcn_max) exit 1
+			printf "%d|%d\n", pci + 0, arfcn + 0
+			exit
+		}
+	' 2>/dev/null
+}
+
+collect_mt5700m_wan_ipv4()
+{
+	local manager_raw="$1"
+	local manager_ip interface device network_raw candidate
+	manager_ip="$(printf '%s' "$manager_raw" | jq -r '.ipv4_address // empty' 2>/dev/null || true)"
+	candidate="$(normalize_ipv4 "$manager_ip" 2>/dev/null || true)"
+	if [ -n "$candidate" ]; then
+		printf '%s' "$candidate"
+		return
+	fi
+	interface="$(printf '%s' "$manager_raw" | jq -r '.interface // empty' 2>/dev/null || true)"
+	device="$(printf '%s' "$manager_raw" | jq -r '.network // empty' 2>/dev/null || true)"
+	network_raw="$(ubus call network.interface dump 2>/dev/null || printf '{}')"
+	candidate="$(printf '%s' "$network_raw" | jq -r --arg interface "$interface" --arg device "$device" '
+		[.interface[]?
+		 | select(.up == true)
+		 | select((.interface == $interface and $interface != "") or (.l3_device == $device and $device != ""))
+		 | select(([.route[]? | select(.target == "0.0.0.0" and (.mask // 0) == 0)] | length) > 0)
+		 | ."ipv4-address"[]?.address][0] // empty
+	' 2>/dev/null || true)"
+	normalize_ipv4 "$candidate" 2>/dev/null || true
+}
+
 collect_mt5700m_status_json()
 {
-	local raw signal_raw temperature_raw metrics network_mode rsrp rsrq sinr temperature online_devices uptime
+	local raw signal_raw cell_raw temperature_raw metrics cell network_mode rsrp rsrq sinr temperature pci arfcn wan online_devices uptime
 	raw="{}"
 	if [ -x "$MT5700M_MANAGER" ]; then
 		raw="$("$MT5700M_MANAGER" status-json 2>/dev/null || printf '{}')"
@@ -497,6 +560,8 @@ collect_mt5700m_status_json()
 	rsrq="未知"
 	sinr="未知"
 	temperature="未知"
+	pci="未知"
+	arfcn="未知"
 	if [ -x "$MT5700M_AT" ]; then
 		signal_raw="$("$MT5700M_AT" command 'AT^HCSQ?' 2>/dev/null || true)"
 		metrics="$(printf '%s\n' "$signal_raw" | awk -F, '
@@ -523,12 +588,20 @@ collect_mt5700m_status_json()
 			rsrq="$(append_unit "${3:-未知}" " dB")"
 			sinr="$(append_unit "${4:-未知}" " dB")"
 		fi
+		cell_raw="$("$MT5700M_AT" command 'AT^MONSC' 2>/dev/null || true)"
+		cell="$(printf '%s\n' "$cell_raw" | parse_mt5700m_monsc 2>/dev/null || true)"
+		if [ -n "$cell" ]; then
+			pci="${cell%%|*}"
+			arfcn="${cell#*|}"
+		fi
 		temperature_raw="$("$MT5700M_AT" temperature 2>/dev/null || true)"
 		temperature="$(printf '%s\n' "$temperature_raw" | awk -F= '
 			$1 == "temperature" && $2 ~ /^-?[0-9]+([.][0-9]+)?$/ { print $2 "°C"; exit }
 		')"
 		[ -n "$temperature" ] || temperature="未知"
 	fi
+	wan="$(collect_mt5700m_wan_ipv4 "$raw")"
+	[ -n "$wan" ] || wan="未知"
 	online_devices="$(count_online_devices)"
 	uptime="$(format_uptime)"
 	printf '%s' "$raw" | jq -c \
@@ -538,7 +611,10 @@ collect_mt5700m_status_json()
 		--arg rsrp "$rsrp" \
 		--arg rsrq "$rsrq" \
 		--arg sinr "$sinr" \
-		--arg temperature "$temperature" '
+		--arg temperature "$temperature" \
+		--arg pci "$pci" \
+		--arg arfcn "$arfcn" \
+		--arg wan "$wan" '
 		def text: if . == null or . == "" then "未知" else tostring end;
 		def online:
 			(.connected // .running // null) as $v
@@ -553,9 +629,9 @@ collect_mt5700m_status_json()
 			rsrq: $rsrq,
 			sinr: $sinr,
 			temperature: $temperature,
-			pci: "未知",
-			arfcn: "未知",
-			wan: ((.ipv4_address // "") | split("/")[0] | text),
+			pci: $pci,
+			arfcn: $arfcn,
+			wan: $wan,
 			uptime: $uptime
 		}
 	' 2>/dev/null || modem_status_unknown_json

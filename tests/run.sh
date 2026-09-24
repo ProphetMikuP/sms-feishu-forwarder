@@ -356,8 +356,11 @@ case "$1" in
 		;;
 	command)
 		printf '%s\n' "$*" >> "$TEST_MT5700M_LOG"
-		[ "$2" = 'AT^HCSQ?' ] || exit 1
-		printf '%s\n' "${TEST_MT5700M_HCSQ:-}"
+		case "$2" in
+			'AT^HCSQ?') printf '%s\n' "${TEST_MT5700M_HCSQ:-}" ;;
+			'AT^MONSC') printf '%s\n' "${TEST_MT5700M_MONSC:-}" ;;
+			*) exit 1 ;;
+		esac
 		;;
 	temperature)
 		printf '%s\n' temperature >> "$TEST_MT5700M_LOG"
@@ -765,13 +768,15 @@ test_mt5700m_status_uses_safe_hcsq_and_temperature_sources()
 	export SMSFF_BACKEND=mt5700m
 	export SMSFF_MT5700M_AT="$MOCK_BIN/mt5700m-at"
 	export TEST_MT5700M_HCSQ='^HCSQ: "NR",54,191,30'
+	export TEST_MT5700M_MONSC='^MONSC: NR,460,00,504990,30,123456789,204,1001,-87,-5,18'
 	export TEST_MT5700M_TEMPERATURE='temp_modem1=41.0
 temperature=43.0
 temperature_sensor=sub6g_pa'
+	export TEST_NETWORK_DUMP='{"interface":[{"interface":"MT5700M","up":true,"l3_device":"eth2","ipv4-address":[{"address":"198.51.100.23","mask":24}],"route":[{"target":"0.0.0.0","mask":0}]}]}'
 	cat > "$MOCK_BIN/mt5700m-manager" <<'EOS'
 #!/bin/sh
 [ "$1" = status-json ] || exit 1
-printf '%s\n' '{"connected":true,"mode":"NCM / ECM","network":"eth2","ipv4_address":"192.0.2.2/24","imei":"867530900000000"}'
+printf '%s\n' '{"connected":true,"mode":"NCM / ECM","interface":"MT5700M","network":"eth2","imei":"867530900000000"}'
 EOS
 	chmod +x "$MOCK_BIN/mt5700m-manager"
 	export SMSFF_MT5700M_MANAGER="$MOCK_BIN/mt5700m-manager"
@@ -781,8 +786,9 @@ EOS
 	assert_eq "MT5700M status converts HCSQ RSRQ" "$(printf '%s' "$status" | jq -r .rsrq)" "-5.0 dB"
 	assert_eq "MT5700M status converts HCSQ SINR" "$(printf '%s' "$status" | jq -r .sinr)" "18.0 dB"
 	assert_eq "MT5700M status uses safe temperature projection" "$(printf '%s' "$status" | jq -r .temperature)" "43.0°C"
-	assert_eq "MT5700M status keeps PCI unknown without safe parser" "$(printf '%s' "$status" | jq -r .pci)" "未知"
-	assert_eq "MT5700M status keeps ARFCN unknown without safe parser" "$(printf '%s' "$status" | jq -r .arfcn)" "未知"
+	assert_eq "MT5700M status parses serving PCI without identity fields" "$(printf '%s' "$status" | jq -r .pci)" "204"
+	assert_eq "MT5700M status parses serving ARFCN without identity fields" "$(printf '%s' "$status" | jq -r .arfcn)" "504990"
+	assert_eq "MT5700M status reads WAN IPv4 from the active MT5700M interface" "$(printf '%s' "$status" | jq -r .wan)" "198.51.100.23"
 	if printf '%s' "$status" | grep -Eq 'eth2|867530900000000'; then
 		fail "MT5700M status excludes interface names and identity"
 	else
@@ -2740,8 +2746,8 @@ test_quota_config_rpc_ui_and_package_contract()
 	grep -q 'usr/lib/sms-feishu-forwarder/quota.sh' "$apk_builder" &&
 		grep -q 'usr/lib/sms-feishu-forwarder/quota.sh' "$ipk_builder" &&
 		pass "APK and IPK include quota helper" || fail "APK and IPK include quota helper"
-	grep -q 'RELEASE.*22\|r22\|1.0.0-22' "$apk_builder" "$ipk_builder" "$apk_test" "$ipk_test" &&
-		pass "package metadata and tests target r22" || fail "package metadata and tests target r22"
+	grep -q 'RELEASE.*23\|r23\|1.0.0-23' "$apk_builder" "$ipk_builder" "$apk_test" "$ipk_test" &&
+		pass "package metadata and tests target r23" || fail "package metadata and tests target r23"
 }
 
 test_quota_sender_normalization_is_exact()

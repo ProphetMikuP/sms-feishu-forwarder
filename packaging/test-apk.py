@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-apk = Path(sys.argv[1] if len(sys.argv) > 1 else "release/luci-app-sms-feishu-forwarder-1.0.0-r22.apk")
+apk = Path(sys.argv[1] if len(sys.argv) > 1 else "release/luci-app-sms-feishu-forwarder-1.0.0-r23.apk")
 assert apk.is_file(), f"missing APK: {apk}"
 blob = apk.read_bytes()
 segments = []
@@ -32,7 +32,7 @@ with tarfile.open(fileobj=io.BytesIO(control_raw), mode="r:") as control:
     assert {".PKGINFO", ".post-install", ".post-upgrade", ".pre-deinstall", ".post-deinstall"} <= names
     pkginfo = control.extractfile(".PKGINFO").read().decode()
 assert "pkgname = luci-app-sms-feishu-forwarder" in pkginfo
-assert "pkgver = 1.0.0-22" in pkginfo
+assert "pkgver = 1.0.0-23" in pkginfo
 assert "arch = aarch64_cortex-a53" in pkginfo
 assert f"datahash = {hashlib.sha256(data_gz).hexdigest()}" in pkginfo
 for dep in ("busybox", "curl", "jq", "luci-base", "rpcd-mod-ucode", "luci-app-mt5700m"):

@@ -1,12 +1,14 @@
-# 短信飞书助手 1.0.0-r22 发布说明
+# 短信飞书助手 1.0.0-r23 发布说明
 
 ## 构建产物
 
-- `release/luci-app-sms-feishu-forwarder-1.0.0-r22.apk`：MT5700M-CN、apk-tools 3、`aarch64_cortex-a53`
-- `release/luci-app-sms-feishu-forwarder_1.0.0-22_all.ipk`：OpenWrt/opkg 兼容包
+- `release/luci-app-sms-feishu-forwarder-1.0.0-r23.apk`：MT5700M-CN、apk-tools 3、`aarch64_cortex-a53`
+- `release/luci-app-sms-feishu-forwarder_1.0.0-23_all.ipk`：OpenWrt/opkg 兼容包
 
-## r22 变更
+## r23 变更
 
+- 通过 MT5700M 原生 `AT^MONSC` 严格提取服务小区 PCI 与 ARFCN，不缓存 MCC、MNC、Cell ID 或 TAC。
+- 从活动的 `network.interface.MT5700M` 默认路由读取 WAN IPv4，补足 manager 状态中没有地址字段的情况。
 - 从已验证的运营商回复中保存并展示“本月通用总量”。
 - 按实机短信文本修正运营商尾段“签满”字段，完成已收回复的校准回填。
 
@@ -49,8 +51,8 @@
 sh tests/run.sh
 python3 packaging/build-apk.py
 sh packaging/build-ipk.sh
-python3 packaging/test-apk.py release/luci-app-sms-feishu-forwarder-1.0.0-r22.apk
-sh packaging/test-ipk.sh release/luci-app-sms-feishu-forwarder_1.0.0-22_all.ipk
+python3 packaging/test-apk.py release/luci-app-sms-feishu-forwarder-1.0.0-r23.apk
+sh packaging/test-ipk.sh release/luci-app-sms-feishu-forwarder_1.0.0-23_all.ipk
 git diff --check
 ```
 

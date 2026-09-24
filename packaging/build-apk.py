@@ -10,7 +10,7 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = os.environ.get("VERSION", "1.0.0")
-RELEASE = os.environ.get("RELEASE", "23")
+RELEASE = os.environ.get("RELEASE", "24")
 ARCH = os.environ.get("ARCH", "aarch64_cortex-a53")
 EPOCH = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
 OUT = Path(os.environ.get("OUT_DIR", ROOT / "release"))

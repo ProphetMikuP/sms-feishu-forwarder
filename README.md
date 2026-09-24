@@ -1,6 +1,6 @@
 # H5000M SMS to Feishu forwarder
 
-Standalone OpenWrt package files for ordered SMS forwarding through the MT5700M native helpers to a Feishu bot. Feishu cards include live CPE/5G status—including serving-cell PCI/ARFCN and the active MT5700M WAN IPv4—and the package also provides managed scheduled SMS and a LuCI WebUI.
+Standalone OpenWrt package files for ordered SMS forwarding through the MT5700M native helpers to a Feishu bot. Feishu cards include live CPE/5G status—including serving-cell PCI/ARFCN, the active MT5700M WAN IPv4, and estimated remaining traffic—and the package also provides managed scheduled SMS and a LuCI WebUI. Signal, cell, and temperature AT queries run only when a new SMS is actually being forwarded.
 
 ## Files
 

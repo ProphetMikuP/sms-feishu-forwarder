@@ -716,11 +716,7 @@ modem_status_elements()
 		printf '[]'
 		return
 	}
-	if [ "${MODEM_STATUS_SOURCE:-live}" = "cache" ]; then
-		status_json="$(read_modem_status_cache_json)"
-	else
-		status_json="$(refresh_modem_status_cache_json)"
-	fi
+	status_json="$(read_modem_status_cache_json)"
 	jq -cn --argjson modem "$status_json" '
 		[
 			{tag:"hr"},
@@ -737,25 +733,44 @@ modem_status_elements()
 		]'
 }
 
+quota_status_elements()
+{
+	local quota_json
+	[ "${ATTACH_STATUS:-1}" = "1" ] || {
+		printf '[]'
+		return
+	}
+	if [ -r "$QUOTA_STATUS_PATH" ]; then
+		quota_json="$(jq -c '{estimated_remaining:(.estimated_remaining // "未知")}' "$QUOTA_STATUS_PATH" 2>/dev/null || printf '{"estimated_remaining":"未知"}')"
+	else
+		quota_json='{"estimated_remaining":"未知"}'
+	fi
+	jq -cn --argjson quota "$quota_json" '
+		[{tag:"div", text:{tag:"lark_md", content:("**剩余流量（估算）**\n" + ($quota.estimated_remaining // "未知"))}}]
+	'
+}
+
 build_card()
 {
 	local ts="$1"
 	local sender="$2"
 	local content="$3"
 	local display_time="${4:-}"
-	local recv_time status_elements
+	local recv_time status_elements quota_elements
 	if [ -n "$display_time" ]; then
 		recv_time="$display_time"
 	else
 		recv_time="$(format_time "$ts")"
 	fi
 	status_elements="$(modem_status_elements 2>/dev/null || printf '[]')"
+	quota_elements="$(quota_status_elements 2>/dev/null || printf '[]')"
 	jq -n \
 		--arg title "$BACKEND_LABEL 短信" \
 		--arg recv "$recv_time" \
 		--arg sender "$sender" \
 		--arg content "$content" \
 		--argjson status_elements "$status_elements" \
+		--argjson quota_elements "$quota_elements" \
 		'{
 			msg_type: "interactive",
 			card: {
@@ -769,7 +784,7 @@ build_card()
 					{ tag: "div", text: { tag: "plain_text", content: $content } }
 				]
 			}
-		} | .card.elements += $status_elements'
+		} | .card.elements += $status_elements | .card.elements += $quota_elements'
 }
 
 send_card_once()
@@ -922,12 +937,11 @@ process_quota_reconcile()
 
 process_poll()
 {
-	local payload flat msg key id ts sender content display_time card rc=0
+	local payload flat msg key id ts sender content display_time card rc=0 status_refreshed=0
 	payload="$(list_sms)" || {
 		log err "failed to list sms"
 		return 1
 	}
-	refresh_modem_status_cache_json >/dev/null 2>&1 || true
 	quota_refresh_status "$QUOTA_CALIBRATION" >/dev/null 2>&1 || true
 	flat="$(mktemp "$WORK_DIR/poll.XXXXXX")" || return 1
 	if ! printf '%s\n' "$payload" | flatten_messages > "$flat"; then
@@ -953,6 +967,10 @@ process_poll()
 		fi
 		if [ "$SETTLE_DELAY" -gt 0 ]; then
 			sleep "$SETTLE_DELAY"
+		fi
+		if [ "$ATTACH_STATUS" = "1" ] && [ "$status_refreshed" -eq 0 ]; then
+			refresh_modem_status_cache_json >/dev/null 2>&1 || true
+			status_refreshed=1
 		fi
 		card="$(build_card "$ts" "$sender" "$content" "$display_time")" || { rc=1; break; }
 		if ! send_card "$card"; then

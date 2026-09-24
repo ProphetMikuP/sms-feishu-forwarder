@@ -796,6 +796,41 @@ EOS
 	fi
 }
 
+test_poll_queries_live_status_only_when_forwarding_and_adds_quota_remaining()
+{
+	setup_case status_only_on_forward
+	make_mt5700m_mock "$MOCK_BIN"
+	export SMSFF_BACKEND=mt5700m
+	export SMSFF_MT5700M_DECODER="$ROOT/files/usr/lib/sms-feishu-forwarder/mt5700m-pdu.awk"
+	export SMSFF_ATTACH_STATUS=1
+	export TEST_FIXTURE="$ROOT/tests/fixtures/mt5700m_gsm7.txt"
+	export TEST_MT5700M_FIXTURE="$TEST_FIXTURE"
+	export TEST_MT5700M_HCSQ='^HCSQ: "NR",54,191,30'
+	export TEST_MT5700M_MONSC='^MONSC: NR,460,00,504990,30,123456789,204,1001,-87,-5,18'
+	export TEST_MT5700M_TEMPERATURE='temperature=43.0'
+	export TEST_NETWORK_DUMP='{"interface":[{"interface":"eth2","up":true,"l3_device":"eth2","ipv4-address":[{"address":"198.51.100.23","mask":24}],"route":[{"target":"0.0.0.0","mask":0}]}]}'
+	export SMSFF_QUOTA_CALIBRATION=7
+	export SMSFF_QUOTA_STATE_PATH="$CASE_DIR/quota-state.json"
+	export SMSFF_QUOTA_STATUS_PATH="$CASE_DIR/quota-status.json"
+	export SMSFF_TRAFFIC_HISTORY_PATH="$CASE_DIR/traffic-history"
+	export SMSFF_NOW_MONTH=2026-09
+	printf '%s\n' '{"interval":"7","result":"ok","carrier_total_centi":10000,"carrier_centi":1234,"last_calibration_stamp":"20260924100000","month":"2026-09","base_rx":"3000000000","base_tx":"4000000000","next_due_epoch":1780826400}' > "$SMSFF_QUOTA_STATE_PATH"
+	printf '%s\n' 'month eth2 2026-09 4000000000 5000000000' > "$SMSFF_TRAFFIC_HISTORY_PATH"
+	run_forwarder --seed
+	: > "$TEST_MT5700M_LOG"
+	run_forwarder --once
+	assert_eq "poll without unseen SMS does not issue status AT commands" "$(grep -Ec 'AT\^HCSQ|AT\^MONSC|^temperature$' "$TEST_MT5700M_LOG" || true)" "0"
+	: > "$SMSFF_STATE_PATH"
+	: > "$TEST_MT5700M_LOG"
+	: > "$TEST_BODIES"
+	run_forwarder --once
+	assert_eq "one forwarding batch queries HCSQ once" "$(grep -c 'command AT\^HCSQ?' "$TEST_MT5700M_LOG" || true)" "1"
+	assert_eq "one forwarding batch queries MONSC once" "$(grep -c 'command AT\^MONSC' "$TEST_MT5700M_LOG" || true)" "1"
+	assert_eq "one forwarding batch queries temperature once" "$(grep -c '^temperature$' "$TEST_MT5700M_LOG" || true)" "1"
+	assert_eq "forwarded card labels estimated remaining traffic" "$(jq -r '.. | strings' "$TEST_BODIES" | grep -c '剩余流量（估算）' || true)" "1"
+	assert_eq "forwarded card includes current estimated remaining traffic" "$(jq -r '.. | strings' "$TEST_BODIES" | grep -c '10.34GB' || true)" "1"
+}
+
 test_status_enriched_card()
 {
 	setup_case status_card
@@ -923,7 +958,7 @@ test_test_mode_unknown_status_when_cache_absent()
 	rm -f "$SMSFF_MODEM_STATUS_PATH"
 	: > "$TEST_UBUS_LOG"
 	run_forwarder --test
-	assert_eq "test card reports unknown when cache absent" "$(jq -r '.. | strings' "$TEST_BODIES" | grep -o '未知' | wc -l)" "10"
+	assert_eq "test card reports unknown when caches are absent" "$(jq -r '.. | strings' "$TEST_BODIES" | grep -o '未知' | wc -l)" "11"
 	if grep -Eq 'qmodem|get_connect_status|base_info|cell_info|network.interface' "$TEST_UBUS_LOG"; then
 		fail "test mode with absent cache avoids live modem calls"
 	else
@@ -2746,8 +2781,8 @@ test_quota_config_rpc_ui_and_package_contract()
 	grep -q 'usr/lib/sms-feishu-forwarder/quota.sh' "$apk_builder" &&
 		grep -q 'usr/lib/sms-feishu-forwarder/quota.sh' "$ipk_builder" &&
 		pass "APK and IPK include quota helper" || fail "APK and IPK include quota helper"
-	grep -q 'RELEASE.*23\|r23\|1.0.0-23' "$apk_builder" "$ipk_builder" "$apk_test" "$ipk_test" &&
-		pass "package metadata and tests target r23" || fail "package metadata and tests target r23"
+	grep -q 'RELEASE.*24\|r24\|1.0.0-24' "$apk_builder" "$ipk_builder" "$apk_test" "$ipk_test" &&
+		pass "package metadata and tests target r24" || fail "package metadata and tests target r24"
 }
 
 test_quota_sender_normalization_is_exact()
@@ -2988,6 +3023,7 @@ run_test()
 run_test test_mt5700m_auto_backend_parses_gsm7_without_qmodem
 run_test test_mt5700m_ucs2_multipart_merges_across_segment_timestamps
 run_test test_mt5700m_status_uses_safe_hcsq_and_temperature_sources
+run_test test_poll_queries_live_status_only_when_forwarding_and_adds_quota_remaining
 run_test test_mt5700m_failed_webhook_retries_without_replaying_success
 run_test test_busybox_awk_decodes_mt5700m_gsm7
 run_test test_source_installer_manages_pdu_decoder

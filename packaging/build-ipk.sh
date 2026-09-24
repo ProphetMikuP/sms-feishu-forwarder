@@ -3,7 +3,7 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 VERSION="${VERSION:-1.0.0}"
-RELEASE="${RELEASE:-23}"
+RELEASE="${RELEASE:-24}"
 PKG="luci-app-sms-feishu-forwarder"
 OUT="${OUT_DIR:-$ROOT/release}"
 WORK="${TMPDIR:-/tmp}/${PKG}-build.$$"

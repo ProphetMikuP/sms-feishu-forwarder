@@ -1,0 +1,14 @@
+{
+	"admin/modem/sms-feishu": {
+		"title": "短信飞书助手",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "sms-feishu-forwarder"
+		},
+		"depends": {
+			"acl": [ "luci-app-sms-feishu-forwarder" ],
+			"uci": { "sms-feishu-forwarder": true }
+		}
+	}
+}

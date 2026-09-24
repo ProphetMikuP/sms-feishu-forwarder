@@ -1,0 +1,586 @@
+#!/bin/ash
+
+set -u
+umask 077
+
+PROG="sms-feishu-scheduler"
+CONFIG="sms-feishu-forwarder"
+DEFAULT_STATE_DIR="/etc/sms-feishu-forwarder/schedule-state"
+DEFAULT_LOCK_DIR="/var/run/sms-feishu-scheduler.lock"
+DEFAULT_MT5700M_AT="/usr/sbin/mt5700m-at"
+DEFAULT_MT5700M_READ="/usr/sbin/mt5700m-read"
+DEFAULT_QUOTA_HELPER="/usr/lib/sms-feishu-forwarder/quota.sh"
+RUNNING=1
+
+QUOTA_HELPER="${SMSFF_TEST_QUOTA_HELPER:-$DEFAULT_QUOTA_HELPER}"
+[ -r "$QUOTA_HELPER" ] && . "$QUOTA_HELPER"
+
+log()
+{
+	local level="$1"
+	shift
+	logger -t "$PROG" -p "daemon.$level" "$*"
+}
+
+uci_get()
+{
+	local key="$1"
+	local default="$2"
+	local value
+	value="$(uci -q get "$key" 2>/dev/null || true)"
+	[ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default"
+}
+
+mask_recipient()
+{
+	local s="$1"
+	local n prefix suffix
+	n=${#s}
+	if [ "$n" -le 4 ]; then
+		printf '****'
+	else
+		prefix=${s%${s#??}}
+		suffix=${s#${s%??}}
+		printf '%s****%s' "$prefix" "$suffix"
+	fi
+}
+
+valid_section_name()
+{
+	case "$1" in
+		""|*[!A-Za-z0-9_]*|[0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_recipient()
+{
+	case "$1" in
+		""|+)
+			return 1
+			;;
+		+*)
+			case "${1#+}" in
+				""|*[!0-9]*) return 1 ;;
+			esac
+			;;
+		*[!0-9]*)
+			return 1
+			;;
+		*) [ "${#1}" -le 20 ] ;;
+	esac
+	[ "${#1}" -le 20 ]
+}
+
+valid_content()
+{
+	[ -n "$1" ]
+}
+
+match_field()
+{
+	local spec="$1"
+	local value="$2"
+	local max="$3"
+	local step
+	case "$spec" in
+		"*") return 0 ;;
+		"*/"*)
+			step="${spec#*/}"
+			case "$step" in ""|*[!0-9]*) return 1 ;; esac
+			[ "$step" -gt 0 ] || return 1
+			[ "$value" -le "$max" ] || return 1
+			[ $((value % step)) -eq 0 ]
+			;;
+		*)
+			case "$spec" in *[!0-9]*) return 1 ;; esac
+			[ "$spec" -eq "$value" ] 2>/dev/null
+			;;
+	esac
+}
+
+match_weekday()
+{
+	local spec="$1"
+	local weekday="$2"
+	local rest item
+	[ "$spec" = "*" ] && return 0
+	rest="$spec"
+	while :; do
+		item="${rest%%,*}"
+		case "$item" in [0-6]) ;; *) return 1 ;; esac
+		[ "$item" -eq "$weekday" ] && return 0
+		[ "$rest" = "$item" ] && break
+		rest="${rest#*,}"
+	done
+	return 1
+}
+
+valid_time_spec()
+{
+	local spec="$1"
+	local max="$2"
+	local step
+	case "$spec" in
+		"*") return 0 ;;
+		"*/"*)
+			step="${spec#*/}"
+			case "$step" in ""|*[!0-9]*|0*) return 1 ;; esac
+			[ "$step" -gt 0 ]
+			;;
+		*)
+			case "$spec" in ""|*[!0-9]*) return 1 ;; esac
+			[ "$spec" -le "$max" ] 2>/dev/null
+			;;
+	esac
+}
+
+valid_weekday_spec()
+{
+	match_weekday "$1" 0 || match_weekday "$1" 1 || match_weekday "$1" 2 || match_weekday "$1" 3 || match_weekday "$1" 4 || match_weekday "$1" 5 || match_weekday "$1" 6
+}
+
+decimal_number()
+{
+	local value="$1"
+	case "$value" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	while [ "${#value}" -gt 1 ]; do
+		case "$value" in
+			0*) value="${value#0}" ;;
+			*) break ;;
+		esac
+	done
+	printf '%s' "$value"
+}
+
+now_parts()
+{
+	if [ -n "${SMSFF_NOW_SLOT:-}" ]; then
+		NOW_SLOT="$SMSFF_NOW_SLOT"
+		NOW_HOUR="${NOW_SLOT#*-*-*-}"
+		NOW_HOUR="${NOW_HOUR%-*}"
+		NOW_MINUTE="${NOW_SLOT##*-}"
+		NOW_WEEKDAY="${SMSFF_NOW_WEEKDAY:-$(date +%w)}"
+	else
+		NOW_SLOT="$(date '+%Y-%m-%d-%H-%M')"
+		NOW_HOUR="$(date '+%H')"
+		NOW_MINUTE="$(date '+%M')"
+		NOW_WEEKDAY="$(date '+%w')"
+	fi
+	NOW_HOUR="$(decimal_number "$NOW_HOUR")" || return 1
+	NOW_MINUTE="$(decimal_number "$NOW_MINUTE")" || return 1
+	NOW_WEEKDAY="$(decimal_number "$NOW_WEEKDAY")" || return 1
+	NOW_EPOCH="$(quota_epoch_now)" || return 1
+	NOW_MESSAGE_STAMP="$(quota_message_stamp_now)"
+}
+
+load_config()
+{
+	ENABLED="$(uci_get "$CONFIG.settings.enabled" "1")"
+	SCHEDULER_ACTIVE="$(uci_get "$CONFIG.settings.scheduler_active" "1")"
+	MT5700M_AT="$DEFAULT_MT5700M_AT"
+	MT5700M_READ="$DEFAULT_MT5700M_READ"
+	if [ "${SMSFF_TESTING:-0}" = "1" ]; then
+		MT5700M_AT="${SMSFF_TEST_MT5700M_AT:-$MT5700M_AT}"
+		MT5700M_READ="${SMSFF_TEST_MT5700M_READ:-$MT5700M_READ}"
+	fi
+	STATE_DIR="${SMSFF_SCHEDULE_STATE_DIR:-$(uci_get "$CONFIG.settings.schedule_state_dir" "$DEFAULT_STATE_DIR")}"
+	LOCK_DIR="${SMSFF_SCHED_LOCK_DIR:-$DEFAULT_LOCK_DIR}"
+	QUOTA_CALIBRATION="${SMSFF_QUOTA_CALIBRATION:-$(uci_get "$CONFIG.settings.quota_calibration" "off")}"
+	QUOTA_STATE_PATH="${SMSFF_QUOTA_STATE_PATH:-$(uci_get "$CONFIG.settings.quota_state_path" "/var/lib/sms-feishu-forwarder/quota-state.json")}"
+	QUOTA_STATUS_PATH="${SMSFF_QUOTA_STATUS_PATH:-$(uci_get "$CONFIG.settings.quota_status_path" "/var/lib/sms-feishu-forwarder/quota-status.json")}"
+}
+
+write_status()
+{
+	local section="$1"
+	local result="$2"
+	local message="$3"
+	mkdir -p "$STATE_DIR" || return 1
+	atomic_write_file "$STATE_DIR/$section.result" "$result" || return 1
+	atomic_write_file "$STATE_DIR/$section.timestamp" "$(date '+%Y-%m-%d %H:%M:%S')" || return 1
+	atomic_write_file "$STATE_DIR/$section.message" "$message"
+}
+
+claim_slot()
+{
+	local section="$1"
+	mkdir -p "$STATE_DIR" || return 1
+	atomic_write_file "$STATE_DIR/$section.last_slot" "$NOW_SLOT"
+}
+
+atomic_write_file()
+{
+	local path="$1"
+	local value="$2"
+	local dir base tmp
+	dir="${path%/*}"
+	base="${path##*/}"
+	mkdir -p "$dir" || return 1
+	tmp="$(mktemp "$dir/.$base.XXXXXX")" || return 1
+	if ! printf '%s\n' "$value" > "$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	if ! chmod 600 "$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	mv -f "$tmp" "$path"
+}
+
+quota_owner_active()
+{
+	[ "${QUOTA_CALIBRATION:-off}" = 7 ] || [ "${QUOTA_CALIBRATION:-off}" = 14 ]
+}
+
+quota_due_now()
+{
+	local state previous_interval next_due
+	quota_owner_active || return 1
+	state="$(quota_state_json)"
+	previous_interval="$(printf '%s' "$state" | jq -r '.interval // empty' 2>/dev/null || true)"
+	next_due="$(printf '%s' "$state" | jq -r '.next_due_epoch // empty' 2>/dev/null || true)"
+	[ "$previous_interval" = "$QUOTA_CALIBRATION" ] || return 0
+	case "$next_due" in
+		""|*[!0-9]*) return 0 ;;
+		*) [ "$NOW_EPOCH" -ge "$next_due" ] 2>/dev/null ;;
+	esac
+}
+
+quota_claim_attempt()
+{
+	local days next state claimed
+	days="$(quota_interval_days "$QUOTA_CALIBRATION")" || return 1
+	next=$((NOW_EPOCH + days * 86400))
+	state="$(quota_state_json)"
+	claimed="$(printf '%s' "$state" | jq -c \
+		--arg interval "$QUOTA_CALIBRATION" \
+		--arg stamp "$NOW_MESSAGE_STAMP" \
+		--argjson now "$NOW_EPOCH" \
+		--argjson next "$next" \
+		'. + {interval:$interval,claim_stamp:$stamp,claim_epoch:$now,next_due_epoch:$next,result:"running"}' 2>/dev/null)" || return 1
+	quota_write_state_json "$claimed" || return 1
+	quota_refresh_status "$QUOTA_CALIBRATION" || return 1
+}
+
+quota_record_result()
+{
+	local result="$1"
+	local state updated
+	state="$(quota_state_json)"
+	if [ "$result" = "ok" ]; then
+		updated="$(printf '%s' "$state" | jq -c \
+			--arg stamp "$NOW_MESSAGE_STAMP" \
+			--argjson now "$NOW_EPOCH" \
+			'. + {result:"ok",last_success_stamp:$stamp,last_success_epoch:$now}' 2>/dev/null)" || return 1
+	else
+		updated="$(printf '%s' "$state" | jq -c '. + {result:"failed"}' 2>/dev/null)" || return 1
+	fi
+	quota_write_state_json "$updated" || return 1
+	quota_refresh_status "$QUOTA_CALIBRATION" || return 1
+}
+
+quota_run_due()
+{
+	quota_interval_days "$QUOTA_CALIBRATION" >/dev/null 2>&1 || {
+		log err "invalid quota calibration interval"
+		return 1
+	}
+	if ! quota_owner_active; then
+		quota_refresh_status off || true
+		return 0
+	fi
+	if ! quota_due_now; then
+		quota_refresh_status "$QUOTA_CALIBRATION" || true
+		return 0
+	fi
+	quota_claim_attempt || return 1
+	if mt5700m_send_confirmed "10086" "CXLL"; then
+		quota_record_result ok || return 1
+		log notice "quota calibration sms sent interval=$QUOTA_CALIBRATION recipient=10086"
+		return 0
+	fi
+	quota_record_result failed || true
+	log err "quota calibration sms failed interval=$QUOTA_CALIBRATION recipient=10086"
+	return 1
+}
+
+send_schedule()
+{
+	local section="$1"
+	local recipient="$2"
+	local content="$3"
+	local claim="${4:-0}"
+	if ! valid_section_name "$section"; then
+		log err "invalid schedule section"
+		return 1
+	fi
+	if ! valid_recipient "$recipient"; then
+		write_status "$section" "failed" "invalid recipient"
+		log err "invalid recipient for schedule=$section"
+		return 1
+	fi
+	if ! valid_content "$content"; then
+		write_status "$section" "failed" "empty content"
+		log err "empty content for schedule=$section"
+		return 1
+	fi
+	if quota_owner_active && quota_is_fixed_query "$recipient" "$content"; then
+		write_status "$section" "suppressed" "quota interval owns fixed query"
+		log notice "fixed 10086 quota query suppressed schedule=$section"
+		[ "$claim" = "1" ] && return 0
+		return 1
+	fi
+	if [ "$claim" = "1" ]; then
+		claim_slot "$section" || return 1
+	fi
+	write_status "$section" "running" "sending" || return 1
+	if mt5700m_send_confirmed "$recipient" "$content"; then
+		if ! write_status "$section" "ok" "sent"; then
+			log err "scheduled sms submitted but status persistence failed schedule=$section recipient=$(mask_recipient "$recipient")"
+			return 1
+		fi
+		log notice "scheduled sms sent schedule=$section recipient=$(mask_recipient "$recipient")"
+		return 0
+	fi
+	write_status "$section" "failed" "modem submission failed"
+	log err "scheduled sms failed schedule=$section recipient=$(mask_recipient "$recipient")"
+	return 1
+}
+
+mt5700m_send_confirmed()
+{
+	local recipient="$1"
+	local content="$2"
+	local start job status state code attempt max_polls
+	[ -x "$MT5700M_AT" ] && [ -x "$MT5700M_READ" ] || return 1
+	start="$("$MT5700M_AT" sms-send-start "$recipient" "$content" 2>/dev/null)" || return 1
+	job="$(printf '%s\n' "$start" | sed -n 's/^job=\(job\.[A-Za-z0-9][A-Za-z0-9]*\)$/\1/p')"
+	case "$job" in job.??????) ;; *) return 1 ;; esac
+	max_polls="${SMSFF_SMS_JOB_POLLS:-75}"
+	attempt=0
+	while [ "$attempt" -lt "$max_polls" ]; do
+		status="$("$MT5700M_READ" sms-send-status "$job" 2>/dev/null)" || return 1
+		state="$(printf '%s\n' "$status" | sed -n 's/^state=//p' | head -n 1)"
+		case "$state" in
+			done)
+				code="$(printf '%s\n' "$status" | sed -n 's/^code=//p' | head -n 1)"
+				[ "$code" = "0" ]
+				return
+				;;
+			queued|running) ;;
+			*) return 1 ;;
+		esac
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+acquire_lock()
+{
+	local lock_pid
+	if ln -s "$$" "$LOCK_DIR" 2>/dev/null; then
+		LOCK_HELD=1
+		return 0
+	fi
+	lock_pid="$(readlink "$LOCK_DIR" 2>/dev/null || true)"
+	case "$lock_pid" in
+		""|*[!0-9]*) ;;
+		*)
+			if kill -0 "$lock_pid" 2>/dev/null; then
+				log warning "another scheduler instance is already running"
+				return 1
+			fi
+			;;
+	esac
+	rm -f "$LOCK_DIR" 2>/dev/null || true
+	if ln -s "$$" "$LOCK_DIR" 2>/dev/null; then
+		LOCK_HELD=1
+		return 0
+	fi
+	log warning "scheduler lock is busy"
+	return 1
+}
+
+release_lock()
+{
+	[ -n "${LOCK_HELD:-}" ] || return 0
+	[ "$(readlink "$LOCK_DIR" 2>/dev/null || true)" = "$$" ] && rm -f "$LOCK_DIR" 2>/dev/null || true
+	unset LOCK_HELD
+}
+
+load_schedules()
+{
+	uci -q show "$CONFIG" 2>/dev/null | sed -n "s/^$CONFIG\\.//p"
+}
+
+get_opt()
+{
+	local _data="$1"
+	local section="$2"
+	local option="$3"
+	local default="$4"
+	local value
+	valid_section_name "$section" || {
+		printf '%s' "$default"
+		return 0
+	}
+	case "$option" in ""|*[!A-Za-z0-9_]*) printf '%s' "$default"; return 0 ;; esac
+	value="$(uci -q get "$CONFIG.$section.$option" 2>/dev/null || true)"
+	[ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default"
+}
+
+section_is_schedule()
+{
+	local data="$1"
+	local section="$2"
+	printf '%s\n' "$data" | grep -Fqx "$section=schedule"
+}
+
+run_due()
+{
+	local data sections section enabled recipient content hour minute weekdays last rc=0 quota_rc
+	[ "${SCHEDULER_ACTIVE:-1}" = "1" ] || return 0
+	now_parts
+	quota_run_due || { quota_rc=$?; rc=1; }
+	data="$(load_schedules)"
+	sections="$(printf '%s\n' "$data" | sed -n "s/^\\([A-Za-z0-9_][A-Za-z0-9_]*\\)=schedule$/\\1/p")"
+	for section in $sections; do
+		valid_section_name "$section" || continue
+		enabled="$(get_opt "$data" "$section" "enabled" "0")"
+		[ "$enabled" = "1" ] || continue
+		recipient="$(get_opt "$data" "$section" "recipient" "")"
+		content="$(get_opt "$data" "$section" "content" "")"
+		hour="$(get_opt "$data" "$section" "hour" "*")"
+		minute="$(get_opt "$data" "$section" "minute" "*")"
+		weekdays="$(get_opt "$data" "$section" "weekdays" "*")"
+		match_field "$hour" "$NOW_HOUR" 23 || continue
+		match_field "$minute" "$NOW_MINUTE" 59 || continue
+		match_weekday "$weekdays" "$NOW_WEEKDAY" || continue
+		last="$(cat "$STATE_DIR/$section.last_slot" 2>/dev/null || true)"
+		[ "$last" = "$NOW_SLOT" ] && continue
+		send_schedule "$section" "$recipient" "$content" 1 || rc=1
+	done
+	return "$rc"
+}
+
+check_config()
+{
+	local data sections section recipient content hour minute weekdays
+	[ -x "$MT5700M_AT" ] && [ -x "$MT5700M_READ" ] || return 1
+	quota_interval_days "$QUOTA_CALIBRATION" >/dev/null 2>&1 || return 1
+	data="$(load_schedules)"
+	sections="$(printf '%s\n' "$data" | sed -n "s/^\\([A-Za-z0-9_][A-Za-z0-9_]*\\)=schedule$/\\1/p")"
+	for section in $sections; do
+		valid_section_name "$section" || return 1
+		recipient="$(get_opt "$data" "$section" "recipient" "")"
+		content="$(get_opt "$data" "$section" "content" "")"
+		hour="$(get_opt "$data" "$section" "hour" "*")"
+		minute="$(get_opt "$data" "$section" "minute" "*")"
+		weekdays="$(get_opt "$data" "$section" "weekdays" "*")"
+		valid_recipient "$recipient" || return 1
+		valid_content "$content" || return 1
+		valid_time_spec "$hour" 23 || return 1
+		valid_time_spec "$minute" 59 || return 1
+		valid_weekday_spec "$weekdays" || return 1
+	done
+	return 0
+}
+
+manual_send()
+{
+	local section="$1"
+	local data recipient content
+	now_parts
+	valid_section_name "$section" || return 1
+	data="$(load_schedules)"
+	section_is_schedule "$data" "$section" || return 1
+	recipient="$(get_opt "$data" "$section" "recipient" "")"
+	content="$(get_opt "$data" "$section" "content" "")"
+	send_schedule "$section" "$recipient" "$content" 0
+}
+
+cleanup()
+{
+	RUNNING=0
+	release_lock
+}
+
+trap cleanup INT TERM EXIT
+
+run_due_locked()
+{
+	local rc
+	acquire_lock || return 1
+	run_due
+	rc=$?
+	release_lock
+	return "$rc"
+}
+
+manual_send_locked()
+{
+	local section="$1"
+	local rc
+	acquire_lock || return 1
+	manual_send "$section"
+	rc=$?
+	release_lock
+	return "$rc"
+}
+
+interruptible_sleep()
+{
+	local remaining="$1"
+	while [ "$remaining" -gt 0 ] && [ "$RUNNING" -eq 1 ]; do
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+}
+
+next_minute_sleep()
+{
+	local seconds remaining
+	seconds="$(date '+%S' 2>/dev/null || printf 0)"
+	seconds="$(decimal_number "$seconds")" || seconds=0
+	remaining=$((60 - seconds))
+	[ "$remaining" -gt 0 ] || remaining=60
+	printf '%s' "$remaining"
+}
+
+usage()
+{
+	printf '%s\n' "usage: $PROG [--once|--send SECTION|--check]"
+}
+
+main()
+{
+	local mode="loop" section
+	case "${1:-}" in
+		--once) mode="once" ;;
+		--send) mode="send"; section="${2:-}" ;;
+		--check) mode="check" ;;
+		-h|--help) usage; exit 0 ;;
+		"") ;;
+		*) usage; exit 2 ;;
+	esac
+	load_config
+	[ "$ENABLED" = "1" ] || exit 0
+	case "$mode" in
+		once) run_due_locked ;;
+		send) manual_send_locked "$section" ;;
+		check) check_config ;;
+		loop)
+			while [ "$RUNNING" -eq 1 ]; do
+				run_due_locked || true
+				interruptible_sleep "$(next_minute_sleep)"
+			done
+			;;
+	esac
+}
+
+main "$@"

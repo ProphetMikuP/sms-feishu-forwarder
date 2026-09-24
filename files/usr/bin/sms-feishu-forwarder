@@ -7,11 +7,23 @@ PROG="sms-feishu-forwarder"
 CONFIG="sms-feishu-forwarder"
 DEFAULT_STATE_DIR="/var/lib/sms-feishu-forwarder"
 DEFAULT_STATE_PATH="$DEFAULT_STATE_DIR/seen.keys"
+DEFAULT_FORWARD_STATUS_PATH="$DEFAULT_STATE_DIR/latest.result"
+DEFAULT_MODEM_STATUS_PATH="$DEFAULT_STATE_DIR/modem-status.json"
 DEFAULT_LOCK_DIR="/var/run/sms-feishu-forwarder.lock"
+DEFAULT_BOOT_SEED_PATH="/var/run/sms-feishu-forwarder.boot-seeded"
+DEFAULT_MT5700M_AT="/usr/sbin/mt5700m-at"
+DEFAULT_MT5700M_READ="/usr/sbin/mt5700m-read"
+DEFAULT_MT5700M_MANAGER="/usr/sbin/mt5700m-manager"
+DEFAULT_MT5700M_DECODER="/usr/lib/sms-feishu-forwarder/mt5700m-pdu.awk"
+DEFAULT_QUOTA_HELPER="/usr/lib/sms-feishu-forwarder/quota.sh"
 MAX_STATE_KEYS="${SMSFF_MAX_STATE_KEYS:-5000}"
 SEND_ATTEMPTS="${SMSFF_SEND_ATTEMPTS:-3}"
 BACKOFF_BASE="${SMSFF_BACKOFF_BASE:-1}"
 RUNNING=1
+BACKEND_LABEL="MT5700M"
+
+QUOTA_HELPER="${SMSFF_TEST_QUOTA_HELPER:-$DEFAULT_QUOTA_HELPER}"
+[ -r "$QUOTA_HELPER" ] && . "$QUOTA_HELPER"
 
 log()
 {
@@ -50,14 +62,26 @@ uci_get()
 load_config()
 {
 	ENABLED="${SMSFF_ENABLED:-$(uci_get "$CONFIG.settings.enabled" "1")}"
-	MODEM_SECTION="${SMSFF_MODEM_SECTION:-$(uci_get "$CONFIG.settings.modem_section" "2_1")}"
 	POLL_INTERVAL="${SMSFF_POLL_INTERVAL:-$(uci_get "$CONFIG.settings.poll_interval" "10")}"
 	SETTLE_DELAY="${SMSFF_SETTLE_DELAY:-$(uci_get "$CONFIG.settings.settle_delay" "0")}"
+	ATTACH_STATUS="${SMSFF_ATTACH_STATUS:-$(uci_get "$CONFIG.settings.attach_status" "1")}"
 	STATE_PATH="${SMSFF_STATE_PATH:-$(uci_get "$CONFIG.settings.state_path" "$DEFAULT_STATE_PATH")}"
+	FORWARD_STATUS_PATH="${SMSFF_FORWARD_STATUS_PATH:-$(uci_get "$CONFIG.settings.forward_status_path" "$DEFAULT_FORWARD_STATUS_PATH")}"
+	MODEM_STATUS_PATH="${SMSFF_MODEM_STATUS_PATH:-$(uci_get "$CONFIG.settings.modem_status_path" "$DEFAULT_MODEM_STATUS_PATH")}"
+	QUOTA_CALIBRATION="${SMSFF_QUOTA_CALIBRATION:-$(uci_get "$CONFIG.settings.quota_calibration" "off")}"
+	QUOTA_STATE_PATH="${SMSFF_QUOTA_STATE_PATH:-$(uci_get "$CONFIG.settings.quota_state_path" "$DEFAULT_STATE_DIR/quota-state.json")}"
+	QUOTA_STATUS_PATH="${SMSFF_QUOTA_STATUS_PATH:-$(uci_get "$CONFIG.settings.quota_status_path" "$DEFAULT_STATE_DIR/quota-status.json")}"
 	LOCK_DIR="${SMSFF_LOCK_DIR:-$DEFAULT_LOCK_DIR}"
-	WEBHOOK="${SMSFF_WEBHOOK:-$(uci_get "$CONFIG.settings.feishu_webhook" "")}"
-	if [ -z "$WEBHOOK" ]; then
-		WEBHOOK="$(uci_get "smsforward.settings.feishu_webhook" "")"
+	BOOT_SEED_PATH="${SMSFF_BOOT_SEED_PATH:-$DEFAULT_BOOT_SEED_PATH}"
+	WEBHOOK="${SMSFF_WEBHOOK:-$(uci_get "smsforward.settings.feishu_webhook" "")}"
+	MT5700M_AT="$DEFAULT_MT5700M_AT"
+	MT5700M_READ="$DEFAULT_MT5700M_READ"
+	MT5700M_MANAGER="$DEFAULT_MT5700M_MANAGER"
+	MT5700M_DECODER="${SMSFF_MT5700M_DECODER:-$DEFAULT_MT5700M_DECODER}"
+	if [ "${SMSFF_TESTING:-0}" = "1" ]; then
+		MT5700M_AT="${SMSFF_TEST_MT5700M_AT:-$MT5700M_AT}"
+		MT5700M_READ="${SMSFF_TEST_MT5700M_READ:-$MT5700M_READ}"
+		MT5700M_MANAGER="${SMSFF_TEST_MT5700M_MANAGER:-$MT5700M_MANAGER}"
 	fi
 	STATE_DIR="${STATE_PATH%/*}"
 }
@@ -82,7 +106,7 @@ acquire_lock()
 		fi
 		if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
 			log warning "another instance is already running"
-			exit 0
+			exit 1
 		fi
 		rm -rf "$LOCK_DIR"
 		mkdir "$LOCK_DIR" || exit 1
@@ -93,45 +117,149 @@ acquire_lock()
 	chmod 700 "$WORK_DIR"
 }
 
-json_for_modem()
+mt5700m_list_sms()
 {
-	jq -cn --arg config_section "$MODEM_SECTION" '{config_section:$config_section}'
+	[ -x "$MT5700M_READ" ] || return 1
+	"$MT5700M_READ" sms-list
 }
 
 list_sms()
 {
-	ubus call qmodem_sms list_sms "$(json_for_modem)"
+	mt5700m_list_sms
+}
+
+mt5700m_extract_pdus()
+{
+	awk '
+		/^[[:space:]]*\+CMGL:[[:space:]]*/ {
+			header = $0
+			sub(/^[^:]*:[[:space:]]*/, "", header)
+			split(header, fields, ",")
+			msg_index = fields[1]
+			gsub(/[[:space:]]/, "", msg_index)
+			active = (msg_index != "")
+			next
+		}
+		active && /^[[:space:]]*[0-9A-Fa-f]+[[:space:]]*$/ {
+			pdu = $0
+			gsub(/[[:space:]]/, "", pdu)
+			if (pdu != "")
+				printf "%s|%s\n", msg_index, pdu
+			active = 0
+			next
+		}
+		active && /^[[:space:]]*$/ { next }
+		active { active = 0 }
+	'
+}
+
+mt5700m_flatten_messages()
+{
+	local pdus_file segments record_dir index pdu sender timestamp display_time concat_ref concat_total concat_seq content rc=0
+	pdus_file="$(mktemp "$WORK_DIR/mt5700m-pdus.XXXXXX")" || return 1
+	if ! mt5700m_extract_pdus > "$pdus_file"; then
+		rm -f "$pdus_file"
+		return 1
+	fi
+	segments="$(mktemp "$WORK_DIR/mt5700m-segments.XXXXXX")" || {
+		rm -f "$pdus_file"
+		return 1
+	}
+	while IFS='|' read -r index pdu; do
+		[ -n "$pdu" ] || continue
+		record_dir="$(mktemp -d "$WORK_DIR/mt5700m-record.XXXXXX")" || { rc=1; break; }
+		if ! awk -v pdu="$pdu" -v out="$record_dir" -f "$MT5700M_DECODER"; then
+			rm -rf "$record_dir"
+			rc=1
+			break
+		fi
+		sender="$(cat "$record_dir/sender")"
+		timestamp="$(cat "$record_dir/timestamp")"
+		display_time="$(cat "$record_dir/display_time")"
+		concat_ref="$(cat "$record_dir/concat_ref")"
+		concat_total="$(cat "$record_dir/concat_total")"
+		concat_seq="$(cat "$record_dir/concat_seq")"
+		content="$(cat "$record_dir/content")"
+		if ! jq -cn \
+			--arg index "$index" \
+			--arg timestamp "$timestamp" \
+			--arg display_time "$display_time" \
+			--arg sender "$sender" \
+			--arg concat_ref "$concat_ref" \
+			--arg concat_total "$concat_total" \
+			--arg concat_seq "$concat_seq" \
+			--arg content "$content" \
+			'{index:$index,timestamp:($timestamp|tonumber),display_time:$display_time,sender:$sender,concat_ref:$concat_ref,total:($concat_total|tonumber),concat_seq:($concat_seq|tonumber),content:$content}' >> "$segments"; then
+			rm -rf "$record_dir"
+			rc=1
+			break
+		fi
+		rm -rf "$record_dir"
+	done < "$pdus_file"
+	if [ "$rc" -eq 0 ]; then
+		if ! jq -s -r '
+			def group_key:
+				if ((.concat_ref // "") != "") then
+					["concat", (.sender // ""), (.concat_ref // ""), ((.total // 1) | tostring)] | join("|")
+				else
+					["single", (.index // "")] | join("|")
+				end;
+			def split_reused_reference:
+				reduce (sort_by(.timestamp, .index)[]) as $part
+					({groups:[]};
+						if (.groups | length) == 0 then
+							.groups += [{parts:[$part],max_timestamp:$part.timestamp,sequences:[$part.concat_seq]}]
+						elif ($part.timestamp - .groups[-1].max_timestamp) > 300 then
+							.groups += [{parts:[$part],max_timestamp:$part.timestamp,sequences:[$part.concat_seq]}]
+						elif ((.groups[-1].sequences | index($part.concat_seq)) != null) then
+							.groups += [{parts:[$part],max_timestamp:$part.timestamp,sequences:[$part.concat_seq]}]
+						else
+							.groups[-1].parts += [$part]
+							| .groups[-1].max_timestamp = $part.timestamp
+							| .groups[-1].sequences += [$part.concat_seq]
+						end
+					)
+				| .groups | map(.parts);
+			def make_message:
+				sort_by(.concat_seq, .timestamp, .index) as $parts |
+				{
+					id: ($parts | map(.index) | join(",")),
+					timestamp: ($parts | map(.timestamp) | min),
+					display_time: $parts[0].display_time,
+					sender: $parts[0].sender,
+					content: ($parts | map(.content) | join("")),
+					total: ($parts[0].total),
+					part_ids: ($parts | map(.index)),
+					concat_sequences: ($parts | map(.concat_seq)),
+					backend: "mt5700m",
+					key: ("mt5700m|" + ($parts | map(.index) | join(",")) + "|" + (($parts | map(.timestamp) | min) | tostring) + "|" + ($parts[0].sender // "") + "|" + ($parts[0].concat_ref // "") + "|" + (($parts[0].total // 1) | tostring))
+				};
+			sort_by([group_key, .timestamp, .index])
+			| group_by(group_key)
+			| map(if ((.[0].concat_ref // "") != "") then split_reused_reference else [.] end)
+			| if length == 0 then [] else add end
+			| map(make_message)
+			| sort_by(.timestamp, .id)
+			| .[]
+			| @base64
+		' "$segments"; then
+			rc=1
+		fi
+	fi
+	rm -f "$segments" "$pdus_file"
+	return "$rc"
 }
 
 flatten_messages()
 {
-	jq -r '
-		def part_ids_array: [ .part_ids[]? | tostring ];
-		[
-			.conversations[]?.messages[]?
-			| select((.type // "") == "received")
-			| {
-				id: (.id | tostring),
-				timestamp: ((.timestamp // 0) | tonumber),
-				sender: (.sender // ""),
-				content: (.content // ""),
-				total: ((.total // 1) | tonumber),
-				part_ids: part_ids_array
-			}
-			| .part_key = (.part_ids | join(","))
-			| .key = ((.timestamp | tostring) + "|" + .id + "|" + .part_key + "|" + (.total | tostring))
-		]
-		| sort_by(.timestamp, (.id as $id | try ($id | tonumber) catch 0), .id)
-		| .[]
-		| @base64
-	'
+	mt5700m_flatten_messages
 }
 
 decode_field()
 {
 	local encoded="$1"
 	local expr="$2"
-	printf '%s' "$encoded" | base64 -d | jq -r "$expr"
+	printf '%s' "$encoded" | jq -Rr '@base64d' | jq -r "$expr"
 }
 
 is_seen()
@@ -174,6 +302,15 @@ mark_seen()
 	mv "$tmp" "$STATE_PATH"
 }
 
+write_forward_status()
+{
+	local result="$1"
+	local dir
+	dir="${FORWARD_STATUS_PATH%/*}"
+	mkdir -p "$dir" 2>/dev/null || return 0
+	printf '%s\n' "$result" > "$FORWARD_STATUS_PATH" 2>/dev/null || true
+}
+
 seed_seen()
 {
 	local payload tmp flat msg key
@@ -211,21 +348,317 @@ seed_seen()
 	log notice "seeded current received sms as seen"
 }
 
+prepare_boot_state()
+{
+	local dir tmp
+	[ -e "$BOOT_SEED_PATH" ] && return 0
+	seed_seen || return 1
+	dir="${BOOT_SEED_PATH%/*}"
+	mkdir -p "$dir" || return 1
+	tmp="$(mktemp "$dir/.boot-seeded.XXXXXX")" || return 1
+	if ! printf '%s\n' "$(date +%s 2>/dev/null || printf unknown)" > "$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	chmod 600 "$tmp" 2>/dev/null || true
+	mv "$tmp" "$BOOT_SEED_PATH"
+}
+
 message_complete()
 {
 	local encoded="$1"
-	local total count
+	local total sequences expected
 	total="$(decode_field "$encoded" '.total')"
-	count="$(decode_field "$encoded" '.part_ids | length')"
-	[ "$total" -le 1 ] || [ "$count" -ge "$total" ]
+	[ "$total" -le 1 ] && return 0
+	sequences="$(decode_field "$encoded" '.concat_sequences | map(tonumber) | sort | unique | join(",")')" || return 1
+	expected="$(printf '%s\n' "$total" | jq -Rr 'tonumber as $total | [range(1; $total + 1)] | join(",")')" || return 1
+	[ "$sequences" = "$expected" ]
 }
 
 format_time()
 {
 	local ts="$1"
-	# qmodem exposes modem wall-clock time encoded as an epoch-like value.
-	# Render it in UTC to avoid applying the router's +08:00 offset a second time.
+	# Fallback for records without the modem-provided display_time.
 	date -u -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u -r "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$ts"
+}
+
+json_get_first()
+{
+	local json="$1"
+	local expr="$2"
+	local value
+	value="$(printf '%s' "$json" | jq -r "$expr // empty" 2>/dev/null | sed -n '1p' || true)"
+	[ -n "$value" ] && [ "$value" != "null" ] && printf '%s' "$value" || printf '未知'
+}
+
+modem_info_get()
+{
+	local json="$1"
+	local key="$2"
+	local value
+	value="$(printf '%s' "$json" | jq -r --arg key "$key" '
+		[
+			.modem_info[]?
+			| select((.key // "") == $key)
+			| (.value // empty) as $value
+			| (.unit // "") as $unit
+			| if ($value | tostring | length) == 0 then empty
+			  elif ($unit | tostring | length) > 0 then (($value | tostring) + " " + ($unit | tostring))
+			  else ($value | tostring)
+			  end
+		][0] // empty
+	' 2>/dev/null | sed -n '1p' || true)"
+	[ -n "$value" ] && [ "$value" != "null" ] && printf '%s' "$value" || printf '未知'
+}
+
+status_value_is_online()
+{
+	local value normalized
+	value="$(jq -r '(.online // .connected // .connect // .status // .connection_status // "") | tostring' 2>/dev/null | sed -n '1p' || true)"
+	[ -n "$value" ] || return 0
+	normalized="$(printf '%s' "$value" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+	case "$normalized" in
+		1|true|yes|online|connected|up) printf '在线' ;;
+		*) printf '离线' ;;
+	esac
+}
+
+base_status_value_is_online()
+{
+	local value normalized
+	value="$(jq -r '(.online // .connected // .connect_status // .status // "") | tostring' 2>/dev/null | sed -n '1p' || true)"
+	[ -n "$value" ] || return 0
+	normalized="$(printf '%s' "$value" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+	case "$normalized" in
+		1|true|yes|online|connected|up) printf '在线' ;;
+	esac
+}
+
+append_unit()
+{
+	local value="$1"
+	local unit="$2"
+	case "$value" in
+		""|未知) printf '未知' ;;
+		*"$unit") printf '%s' "$value" ;;
+		*) printf '%s%s' "$value" "$unit" ;;
+	esac
+}
+
+format_uptime()
+{
+	local up seconds days hours minutes uptime_path
+	uptime_path="${SMSFF_UPTIME_PATH:-/proc/uptime}"
+	if read -r up _ < "$uptime_path" 2>/dev/null; then
+		seconds="${up%.*}"
+		case "$seconds" in *[!0-9]*|"") printf '未知'; return ;; esac
+		days=$((seconds / 86400))
+		hours=$(((seconds % 86400) / 3600))
+		minutes=$(((seconds % 3600) / 60))
+		if [ "$days" -gt 0 ]; then
+			printf '%s天%s小时%s分钟' "$days" "$hours" "$minutes"
+		elif [ "$hours" -gt 0 ]; then
+			printf '%s小时%s分钟' "$hours" "$minutes"
+		else
+			printf '%s分钟' "$minutes"
+		fi
+	else
+		printf '未知'
+	fi
+}
+
+count_online_devices()
+{
+	local leases_path now
+	leases_path="${SMSFF_DHCP_LEASES_PATH:-/tmp/dhcp.leases}"
+	[ -r "$leases_path" ] || {
+		printf '未知'
+		return
+	}
+	now="$(date +%s 2>/dev/null || true)"
+	case "$now" in *[!0-9]*|"") printf '未知'; return ;; esac
+	awk -v now="$now" '
+		NF >= 4 && ($1 == 0 || $1 > now) && $2 != "" {
+			if (!seen[$2]++) count++
+		}
+		END { print (count + 0) "台" }
+	' "$leases_path" 2>/dev/null || printf '未知'
+}
+
+collect_mt5700m_status_json()
+{
+	local raw signal_raw temperature_raw metrics network_mode rsrp rsrq sinr temperature online_devices uptime
+	raw="{}"
+	if [ -x "$MT5700M_MANAGER" ]; then
+		raw="$("$MT5700M_MANAGER" status-json 2>/dev/null || printf '{}')"
+	fi
+	network_mode="未知"
+	rsrp="未知"
+	rsrq="未知"
+	sinr="未知"
+	temperature="未知"
+	if [ -x "$MT5700M_AT" ]; then
+		signal_raw="$("$MT5700M_AT" command 'AT^HCSQ?' 2>/dev/null || true)"
+		metrics="$(printf '%s\n' "$signal_raw" | awk -F, '
+			function clean(value) {
+				gsub(/[[:space:]\r\"]/, "", value)
+				return value
+			}
+			function valid(value) { return value ~ /^[0-9]+$/ && value != 255 }
+			/^\^HCSQ:/ {
+				sub(/^\^HCSQ:[[:space:]]*/, "", $1)
+				sys = clean($1)
+				if (sys == "NR" && valid(clean($2)) && valid(clean($3)) && valid(clean($4))) {
+					rsrp = clean($2) >= 97 ? -44 : clean($2) - 141
+					sinr = clean($3) >= 251 ? 30.0 : -20.2 + clean($3) * 0.2
+					rsrq = clean($4) >= 34 ? -3.0 : -20 + clean($4) * 0.5
+					printf "%s %d %.1f %.1f\n", sys, rsrp, rsrq, sinr
+				}
+				exit
+			}' )"
+		if [ -n "$metrics" ]; then
+			set -- $metrics
+			network_mode="${1:-未知}"
+			rsrp="$(append_unit "${2:-未知}" " dBm")"
+			rsrq="$(append_unit "${3:-未知}" " dB")"
+			sinr="$(append_unit "${4:-未知}" " dB")"
+		fi
+		temperature_raw="$("$MT5700M_AT" temperature 2>/dev/null || true)"
+		temperature="$(printf '%s\n' "$temperature_raw" | awk -F= '
+			$1 == "temperature" && $2 ~ /^-?[0-9]+([.][0-9]+)?$/ { print $2 "°C"; exit }
+		')"
+		[ -n "$temperature" ] || temperature="未知"
+	fi
+	online_devices="$(count_online_devices)"
+	uptime="$(format_uptime)"
+	printf '%s' "$raw" | jq -c \
+		--arg online_devices "$online_devices" \
+		--arg uptime "$uptime" \
+		--arg network_mode "$network_mode" \
+		--arg rsrp "$rsrp" \
+		--arg rsrq "$rsrq" \
+		--arg sinr "$sinr" \
+		--arg temperature "$temperature" '
+		def text: if . == null or . == "" then "未知" else tostring end;
+		def online:
+			(.connected // .running // null) as $v
+			| if $v == true or $v == 1 or (($v | tostring | ascii_downcase) == "yes") then "在线"
+			  elif $v == false or $v == 0 or (($v | tostring | ascii_downcase) == "no") then "离线"
+			  else "未知" end;
+		{
+			online: online,
+			online_devices: $online_devices,
+			network_mode: $network_mode,
+			rsrp: $rsrp,
+			rsrq: $rsrq,
+			sinr: $sinr,
+			temperature: $temperature,
+			pci: "未知",
+			arfcn: "未知",
+			wan: ((.ipv4_address // "") | split("/")[0] | text),
+			uptime: $uptime
+		}
+	' 2>/dev/null || modem_status_unknown_json
+}
+
+collect_modem_status_json()
+{
+	collect_mt5700m_status_json
+}
+
+modem_status_unknown_json()
+{
+	jq -cn '{
+		online:"未知",
+		online_devices:"未知",
+		network_mode:"未知",
+		rsrp:"未知",
+		rsrq:"未知",
+		sinr:"未知",
+		temperature:"未知",
+		pci:"未知",
+		arfcn:"未知",
+		wan:"未知",
+		uptime:"未知"
+	}'
+}
+
+sanitize_modem_status_json()
+{
+	jq -c '{
+		online:(.online // "未知"),
+		online_devices:(.online_devices // "未知"),
+		network_mode:(.network_mode // "未知"),
+		rsrp:(.rsrp // "未知"),
+		rsrq:(.rsrq // "未知"),
+		sinr:(.sinr // "未知"),
+		temperature:(.temperature // "未知"),
+		pci:(.pci // "未知"),
+		arfcn:(.arfcn // "未知"),
+		wan:(.wan // "未知"),
+		uptime:(.uptime // "未知")
+	}' 2>/dev/null
+}
+
+write_modem_status_cache()
+{
+	local status_json="$1"
+	local dir tmp
+	dir="${MODEM_STATUS_PATH%/*}"
+	mkdir -p "$dir" 2>/dev/null || return 0
+	tmp="$(mktemp "$dir/.modem-status.XXXXXX")" || return 0
+	chmod 600 "$tmp" 2>/dev/null || true
+	if ! printf '%s\n' "$status_json" | sanitize_modem_status_json > "$tmp"; then
+		rm -f "$tmp"
+		return 0
+	fi
+	chmod 600 "$tmp" 2>/dev/null || true
+	mv "$tmp" "$MODEM_STATUS_PATH" 2>/dev/null || rm -f "$tmp"
+}
+
+refresh_modem_status_cache_json()
+{
+	local status_json
+	status_json="$(collect_modem_status_json 2>/dev/null || modem_status_unknown_json)"
+	write_modem_status_cache "$status_json"
+	printf '%s\n' "$status_json" | sanitize_modem_status_json || modem_status_unknown_json
+}
+
+read_modem_status_cache_json()
+{
+	if [ -r "$MODEM_STATUS_PATH" ]; then
+		sanitize_modem_status_json < "$MODEM_STATUS_PATH" || modem_status_unknown_json
+	else
+		modem_status_unknown_json
+	fi
+}
+
+modem_status_elements()
+{
+	local status_json
+	[ "${ATTACH_STATUS:-1}" = "1" ] || {
+		printf '[]'
+		return
+	}
+	if [ "${MODEM_STATUS_SOURCE:-live}" = "cache" ]; then
+		status_json="$(read_modem_status_cache_json)"
+	else
+		status_json="$(refresh_modem_status_cache_json)"
+	fi
+	jq -cn --argjson modem "$status_json" '
+		[
+			{tag:"hr"},
+			{tag:"div", fields:[
+				{is_short:true,text:{tag:"lark_md",content:("**在线设备**\n" + ($modem.online_devices // "未知"))}},
+				{is_short:true,text:{tag:"lark_md",content:("**网络模式**\n" + ($modem.network_mode // "未知"))}},
+				{is_short:true,text:{tag:"lark_md",content:("**RSRP**\n" + ($modem.rsrp // "未知"))}},
+				{is_short:true,text:{tag:"lark_md",content:("**RSRQ / SINR**\n" + (($modem.rsrq // "未知") + " / " + ($modem.sinr // "未知")))}},
+				{is_short:true,text:{tag:"lark_md",content:("**模组温度**\n" + ($modem.temperature // "未知"))}},
+				{is_short:true,text:{tag:"lark_md",content:("**PCI / ARFCN**\n" + (($modem.pci // "未知") + " / " + ($modem.arfcn // "未知")))}},
+				{is_short:true,text:{tag:"lark_md",content:("**WAN 地址**\n" + ($modem.wan // "未知"))}},
+				{is_short:true,text:{tag:"lark_md",content:("**运行时间**\n" + ($modem.uptime // "未知"))}}
+			]}
+		]'
 }
 
 build_card()
@@ -233,13 +666,20 @@ build_card()
 	local ts="$1"
 	local sender="$2"
 	local content="$3"
-	local recv_time
-	recv_time="$(format_time "$ts")"
+	local display_time="${4:-}"
+	local recv_time status_elements
+	if [ -n "$display_time" ]; then
+		recv_time="$display_time"
+	else
+		recv_time="$(format_time "$ts")"
+	fi
+	status_elements="$(modem_status_elements 2>/dev/null || printf '[]')"
 	jq -n \
-		--arg title "H5000M 短信" \
+		--arg title "$BACKEND_LABEL 短信" \
 		--arg recv "$recv_time" \
 		--arg sender "$sender" \
 		--arg content "$content" \
+		--argjson status_elements "$status_elements" \
 		'{
 			msg_type: "interactive",
 			card: {
@@ -253,7 +693,7 @@ build_card()
 					{ tag: "div", text: { tag: "plain_text", content: $content } }
 				]
 			}
-		}'
+		} | .card.elements += $status_elements'
 }
 
 send_card_once()
@@ -315,25 +755,104 @@ send_card()
 	return 1
 }
 
-mark_qmodem_forwarded()
+quota_reply_candidate()
 {
 	local encoded="$1"
-	local ids args
-	ids="$(printf '%s' "$encoded" | base64 -d | jq -c '
-		(if (.part_ids | length) > 0 then .part_ids else [.id] end)
-		| map(. as $value | try ($value | tonumber) catch $value)
-	')"
-	args="$(jq -cn --arg config_section "$MODEM_SECTION" --argjson ids "$ids" '{config_section:$config_section,ids:$ids}')"
-	ubus call qmodem_sms mark_forwarded "$args" >/dev/null 2>&1 || true
+	local sender="$2"
+	local timestamp state result success_stamp
+	case "$QUOTA_CALIBRATION" in 7|14) ;; *) return 1 ;; esac
+	timestamp="$(decode_field "$encoded" '.timestamp')" || return 1
+	state="$(quota_state_json)"
+	result="$(printf '%s' "$state" | jq -r '.result // empty' 2>/dev/null || true)"
+	success_stamp="$(printf '%s' "$state" | jq -r '.last_success_stamp // empty' 2>/dev/null || true)"
+	[ "$result" = "ok" ] || return 1
+	case "$timestamp:$success_stamp" in
+		??????????????:??????????????) ;;
+		*) return 1 ;;
+	esac
+	[ "$timestamp" = "$success_stamp" ] && return 1
+	[ "$timestamp" \< "$success_stamp" ] && return 1
+	quota_parse_reply_remaining "$sender" "$(decode_field "$encoded" '.content')" >/dev/null 2>&1
+}
+
+quota_apply_reply()
+{
+	local encoded="$1"
+	local sender="$2"
+	local content="$3"
+	local total remaining reply_key state previous_key row current_month current_rx current_tx stamp updated
+	remaining="$(quota_parse_reply_remaining "$sender" "$content")" || return 1
+	# The accepted carrier reply contract explicitly states a 100GB monthly total.
+	total=10000
+	reply_key="$(decode_field "$encoded" '.key')" || return 1
+	state="$(quota_state_json)"
+	previous_key="$(printf '%s' "$state" | jq -r '.reply_key // empty' 2>/dev/null || true)"
+	[ "$previous_key" = "$reply_key" ] && return 0
+	row="$(quota_read_current_counters 2>/dev/null || true)"
+	stamp="$(decode_field "$encoded" '.timestamp')" || return 1
+	case "$stamp" in ??????????????) ;; *) return 1 ;; esac
+	if [ -n "$row" ]; then
+		current_month="${row%%|*}"
+		row="${row#*|}"
+		current_rx="${row%%|*}"
+		current_tx="${row#*|}"
+		updated="$(printf '%s' "$state" | jq -c \
+			--arg reply_key "$reply_key" \
+			--arg stamp "$stamp" \
+			--arg month "$current_month" \
+			--arg rx "$current_rx" \
+			--arg tx "$current_tx" \
+			--argjson total "$total" \
+			--argjson remaining "$remaining" \
+			'. + {carrier_total_centi:$total,carrier_centi:$remaining,reply_key:$reply_key,last_calibration_stamp:$stamp,month:$month,base_rx:$rx,base_tx:$tx}' 2>/dev/null)" || return 1
+	else
+		updated="$(printf '%s' "$state" | jq -c \
+			--arg reply_key "$reply_key" \
+			--arg stamp "$stamp" \
+			--argjson total "$total" \
+			--argjson remaining "$remaining" \
+			'. + {carrier_total_centi:$total,carrier_centi:$remaining,reply_key:$reply_key,last_calibration_stamp:$stamp} | del(.month,.base_rx,.base_tx)' 2>/dev/null)" || return 1
+	fi
+	quota_write_state_json "$updated" || return 1
+	quota_refresh_status "$QUOTA_CALIBRATION" || return 1
+	log notice "quota calibration reply applied key=$reply_key"
+}
+
+process_quota_reconcile()
+{
+	local payload flat msg sender content applied=0
+	payload="$(list_sms)" || return 1
+	flat="$(mktemp "$WORK_DIR/quota-reconcile.XXXXXX")" || return 1
+	if ! printf '%s\n' "$payload" | flatten_messages > "$flat"; then
+		rm -f "$flat"
+		return 1
+	fi
+	while IFS= read -r msg; do
+		[ -n "$msg" ] || continue
+		message_complete "$msg" || continue
+		sender="$(decode_field "$msg" '.sender')" || continue
+		content="$(decode_field "$msg" '.content')" || continue
+		if quota_reply_candidate "$msg" "$sender"; then
+			quota_apply_reply "$msg" "$sender" "$content" || {
+				rm -f "$flat"
+				return 1
+			}
+			applied=1
+		fi
+	done < "$flat"
+	rm -f "$flat"
+	[ "$applied" -eq 1 ]
 }
 
 process_poll()
 {
-	local payload flat msg key id ts sender content card rc=0
+	local payload flat msg key id ts sender content display_time card rc=0
 	payload="$(list_sms)" || {
 		log err "failed to list sms"
 		return 1
 	}
+	refresh_modem_status_cache_json >/dev/null 2>&1 || true
+	quota_refresh_status "$QUOTA_CALIBRATION" >/dev/null 2>&1 || true
 	flat="$(mktemp "$WORK_DIR/poll.XXXXXX")" || return 1
 	if ! printf '%s\n' "$payload" | flatten_messages > "$flat"; then
 		log err "failed to parse sms list"
@@ -347,6 +866,7 @@ process_poll()
 		ts="$(decode_field "$msg" '.timestamp')" || { rc=1; break; }
 		sender="$(decode_field "$msg" '.sender')" || { rc=1; break; }
 		content="$(decode_field "$msg" '.content')" || { rc=1; break; }
+		display_time="$(decode_field "$msg" '.display_time // empty')" || { rc=1; break; }
 		if is_seen "$key"; then
 			continue
 		fi
@@ -358,18 +878,26 @@ process_poll()
 		if [ "$SETTLE_DELAY" -gt 0 ]; then
 			sleep "$SETTLE_DELAY"
 		fi
-		card="$(build_card "$ts" "$sender" "$content")" || { rc=1; break; }
+		card="$(build_card "$ts" "$sender" "$content" "$display_time")" || { rc=1; break; }
 		if ! send_card "$card"; then
+			write_forward_status "failed"
 			log err "failed forwarding oldest unseen sms key=$key id=$id sender=$(mask_sender "$sender")"
 			rc=1
 			break
+		fi
+		if quota_reply_candidate "$msg" "$sender"; then
+			if ! quota_apply_reply "$msg" "$sender" "$content"; then
+				log err "failed applying quota calibration key=$key id=$id sender=$(mask_sender "$sender")"
+				rc=1
+				break
+			fi
 		fi
 		if ! mark_seen "$key"; then
 			log err "failed writing seen state key=$key id=$id sender=$(mask_sender "$sender")"
 			rc=1
 			break
 		fi
-		mark_qmodem_forwarded "$msg"
+		write_forward_status "ok"
 		log notice "forwarded sms key=$key id=$id sender=$(mask_sender "$sender")"
 	done < "$flat"
 	rm -f "$flat"
@@ -387,7 +915,7 @@ interruptible_sleep()
 
 usage()
 {
-	printf '%s\n' "usage: $PROG [--once|--seed]"
+	printf '%s\n' "usage: $PROG [--once|--seed|--test|--status-json|--quota-reconcile]"
 }
 
 main()
@@ -396,24 +924,48 @@ main()
 	case "${1:-}" in
 		--once) mode="once" ;;
 		--seed) mode="seed" ;;
+		--test) mode="test" ;;
+		--status-json) mode="status_json" ;;
+		--quota-reconcile) mode="quota_reconcile" ;;
 		-h|--help) usage; exit 0 ;;
 		"") ;;
 		*) usage; exit 2 ;;
 	esac
 
 	load_config
+	if [ "$mode" = "status_json" ]; then
+		collect_modem_status_json
+		exit $?
+	fi
 	if [ "$ENABLED" != "1" ] && [ "$mode" != "seed" ]; then
 		log notice "disabled by config"
 		exit 0
 	fi
-	if [ -z "$WEBHOOK" ] && [ "$mode" != "seed" ]; then
+	if [ -z "$WEBHOOK" ] && [ "$mode" != "seed" ] && [ "$mode" != "quota_reconcile" ]; then
 		log err "missing Feishu webhook"
 		exit 1
 	fi
 
+	if [ "$mode" = "test" ]; then
+		LOCK_DIR="${LOCK_DIR}.test"
+		MODEM_STATUS_SOURCE="cache"
+	fi
 	acquire_lock
+	if [ "$mode" = "loop" ] && ! prepare_boot_state; then
+		log err "failed to seed sms backlog for current boot"
+		exit 1
+	fi
 	case "$mode" in
 		seed) seed_seen ;;
+		quota_reconcile) process_quota_reconcile ;;
+		test)
+			if send_card "$(build_card "$(date +%s)" "测试" "H5000M 短信飞书助手测试")"; then
+				write_forward_status "ok"
+			else
+				write_forward_status "failed"
+				return 1
+			fi
+			;;
 		once) process_poll ;;
 		loop)
 			while [ "$RUNNING" -eq 1 ]; do

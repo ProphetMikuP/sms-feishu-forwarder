@@ -3,6 +3,7 @@
 set -eu
 
 ROOT="${ROOT:-/}"
+MANAGED_PATHS="usr/bin/sms-feishu-forwarder usr/bin/sms-feishu-scheduler usr/lib/sms-feishu-forwarder/mt5700m-pdu.awk usr/lib/sms-feishu-forwarder/quota.sh usr/lib/sms-feishu-forwarder/mt5700m-cutover etc/init.d/sms-feishu-forwarder etc/config/sms-feishu-forwarder usr/share/luci/menu.d/luci-app-sms-feishu-forwarder.json usr/share/rpcd/acl.d/luci-app-sms-feishu-forwarder.json usr/share/rpcd/ucode/sms-feishu-forwarder.uc www/luci-static/resources/view/sms-feishu-forwarder.js"
 
 target()
 {
@@ -19,7 +20,33 @@ restore_latest_backup()
 	if [ -e "$src" ]; then
 		mkdir -p "$(dirname "$(target "$rel")")"
 		cp -p "$src" "$(target "$rel")"
+	else
+		rm -f "$(target "$rel")"
 	fi
+}
+
+restore_latest_taskplan_backup()
+{
+	local latest src
+	latest="$(ls -1dt "$ROOT"/etc/sms-feishu-forwarder/backups/* 2>/dev/null | head -n 1 || true)"
+	[ -n "$latest" ] || return 0
+	src="$latest/etc/config/taskplan"
+	[ -e "$src" ] || return 0
+	mkdir -p "$(dirname "$(target etc/config/taskplan)")"
+	cp -p "$src" "$(target etc/config/taskplan)"
+	restart_taskplan
+}
+
+restart_taskplan()
+{
+	[ -x "$(target etc/init.d/taskplan)" ] || return 0
+	"$(target etc/init.d/taskplan)" restart >/dev/null 2>&1 || true
+}
+
+restart_rpcd_best_effort()
+{
+	[ -x "$(target etc/init.d/rpcd)" ] || return 0
+	"$(target etc/init.d/rpcd)" restart >/dev/null 2>&1 || true
 }
 
 if [ "$ROOT" = "/" ] && [ -x /etc/init.d/sms-feishu-forwarder ]; then
@@ -27,8 +54,11 @@ if [ "$ROOT" = "/" ] && [ -x /etc/init.d/sms-feishu-forwarder ]; then
 	/etc/init.d/sms-feishu-forwarder disable >/dev/null 2>&1 || true
 fi
 
-rm -f "$(target usr/bin/sms-feishu-forwarder)" "$(target etc/init.d/sms-feishu-forwarder)"
-restore_latest_backup "etc/config/sms-feishu-forwarder"
+for rel in $MANAGED_PATHS; do
+	restore_latest_backup "$rel"
+done
+restore_latest_taskplan_backup
+restart_rpcd_best_effort
 
 STATE_FILE="$(target etc/sms-feishu-forwarder/legacy-state)"
 if [ "$ROOT" = "/" ] && [ -f "$STATE_FILE" ]; then

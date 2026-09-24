@@ -1,0 +1,17 @@
+{
+	"luci-app-sms-feishu-forwarder": {
+		"description": "Grant access to SMS Feishu helper",
+		"read": {
+			"ubus": {
+				"sms-feishu-forwarder": [ "status", "logs" ]
+			},
+			"uci": [ "sms-feishu-forwarder" ]
+		},
+		"write": {
+			"ubus": {
+				"sms-feishu-forwarder": [ "send_schedule", "test_card", "restart", "seed", "set_webhook" ]
+			},
+			"uci": [ "sms-feishu-forwarder" ]
+		}
+	}
+}

@@ -1,0 +1,124 @@
+#!/bin/ash
+
+set -u
+umask 077
+
+ROOT="${ROOT:-/}"
+STATE_DIR="$ROOT/etc/sms-feishu-forwarder"
+STATE_FILE="$STATE_DIR/legacy-cutover-state"
+MARKER="$STATE_DIR/mt5700m-cutover.complete"
+TASKPLAN="$ROOT/etc/config/taskplan"
+TASKPLAN_BACKUP="$STATE_DIR/taskplan.before-mt5700m-cutover"
+SERVICES="smsforward sms_forwarder ubus-at-daemon"
+
+target()
+{
+	printf '%s/%s' "${ROOT%/}" "$1"
+}
+
+service_flag()
+{
+	local service="$1" action="$2"
+	if [ -x "$(target "etc/init.d/$service")" ] && "$(target "etc/init.d/$service")" "$action" >/dev/null 2>&1; then
+		printf '1'
+	else
+		printf '0'
+	fi
+}
+
+restore_services()
+{
+	local service enabled running
+	[ -f "$STATE_FILE" ] || return 0
+	for service in $SERVICES; do
+		enabled="$(sed -n "s/^${service}_enabled=//p" "$STATE_FILE" | sed -n '1p')"
+		running="$(sed -n "s/^${service}_running=//p" "$STATE_FILE" | sed -n '1p')"
+		[ -x "$(target "etc/init.d/$service")" ] || continue
+		[ "$enabled" = "1" ] && "$(target "etc/init.d/$service")" enable >/dev/null 2>&1 || true
+		[ "$running" = "1" ] && "$(target "etc/init.d/$service")" start >/dev/null 2>&1 || true
+	done
+}
+
+prepare_taskplan()
+{
+	local output="$1"
+	[ -f "$TASKPLAN" ] || return 1
+	grep -q '/root/send_10086_sms.sh' "$TASKPLAN" || return 1
+	awk '
+		function flush_section(    i, disable) {
+			if (count == 0) return
+			disable = (stype == "12" && (section_legacy == 1 || (section_has_script == 0 && global_legacy == 1)))
+			for (i = 1; i <= count; i++) {
+				if (disable && lines[i] ~ /^[[:space:]]*option[[:space:]]+enable[[:space:]]+/)
+					print "\toption enable '\''0'\''"
+				else
+					print lines[i]
+			}
+			count = 0; stype = ""; section_has_script = 0; section_legacy = 0; in_global = 0
+		}
+		/^config[[:space:]]/ {
+			flush_section()
+			if ($0 ~ /^config[[:space:]]+global([[:space:]]|$)/) in_global = 1
+		}
+		{
+			count++; lines[count] = $0
+			if ($0 ~ /^[[:space:]]*option[[:space:]]+customscript[[:space:]]+/) {
+				if (in_global && $0 ~ /\/root\/send_10086_sms\.sh/) global_legacy = 1
+				if (!in_global) {
+					section_has_script = 1
+					if ($0 ~ /\/root\/send_10086_sms\.sh/) section_legacy = 1
+				}
+			}
+			if ($0 ~ /^[[:space:]]*option[[:space:]]+stype[[:space:]]+'\''12'\''/) stype = "12"
+		}
+		END { flush_section() }
+	' "$TASKPLAN" > "$output"
+}
+
+main()
+{
+	local helper service state_tmp task_tmp taskplan_changed=0
+	[ -f "$MARKER" ] && return 0
+	for helper in usr/sbin/mt5700m-at usr/sbin/mt5700m-read usr/sbin/mt5700m-manager; do
+		[ -x "$(target "$helper")" ] || return 1
+	done
+	mkdir -p "$STATE_DIR" || return 1
+	chmod 700 "$STATE_DIR" 2>/dev/null || true
+	state_tmp="$(mktemp "$STATE_DIR/.legacy-cutover-state.XXXXXX")" || return 1
+	for service in $SERVICES; do
+		printf '%s_enabled=%s\n' "$service" "$(service_flag "$service" enabled)" >> "$state_tmp"
+		printf '%s_running=%s\n' "$service" "$(service_flag "$service" running)" >> "$state_tmp"
+	done
+	chmod 600 "$state_tmp" || { rm -f "$state_tmp"; return 1; }
+	mv "$state_tmp" "$STATE_FILE" || return 1
+
+	task_tmp="$(mktemp "$STATE_DIR/.taskplan.XXXXXX")" || return 1
+	if prepare_taskplan "$task_tmp"; then
+		[ -f "$TASKPLAN_BACKUP" ] || cp -p "$TASKPLAN" "$TASKPLAN_BACKUP" || { rm -f "$task_tmp"; return 1; }
+		chmod 600 "$TASKPLAN_BACKUP" 2>/dev/null || true
+		taskplan_changed=1
+	else
+		rm -f "$task_tmp"
+	fi
+
+	for service in $SERVICES; do
+		[ -x "$(target "etc/init.d/$service")" ] || continue
+		"$(target "etc/init.d/$service")" stop >/dev/null 2>&1 || true
+		"$(target "etc/init.d/$service")" disable >/dev/null 2>&1 || true
+	done
+
+	if [ "$taskplan_changed" = "1" ]; then
+		chmod 600 "$task_tmp" || { restore_services; rm -f "$task_tmp"; return 1; }
+		mv "$task_tmp" "$TASKPLAN" || { restore_services; rm -f "$task_tmp"; return 1; }
+		if [ -x "$(target etc/init.d/taskplan)" ] && ! "$(target etc/init.d/taskplan)" restart >/dev/null 2>&1; then
+			cp -p "$TASKPLAN_BACKUP" "$TASKPLAN" 2>/dev/null || true
+			"$(target etc/init.d/taskplan)" restart >/dev/null 2>&1 || true
+			restore_services
+			return 1
+		fi
+	fi
+	printf '%s\n' 'complete' > "$MARKER"
+	chmod 600 "$MARKER"
+}
+
+main "$@"

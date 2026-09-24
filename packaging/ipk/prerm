@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+ROOT="${SMSFF_PACKAGE_ROOT:-${IPKG_INSTROOT:-}}"
+target()
+{
+	if [ -n "$ROOT" ]; then
+		printf '%s/%s' "${ROOT%/}" "$1"
+	else
+		printf '/%s' "$1"
+	fi
+}
+
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+
+INIT_CMD="${SMSFF_PACKAGE_INIT_CMD:-$(target etc/init.d/sms-feishu-forwarder)}"
+STATE_DIR="$(target etc/sms-feishu-forwarder)"
+STATE_FILE="$STATE_DIR/package-service-state"
+mkdir -p "$STATE_DIR"
+
+enabled=0
+running=0
+if [ -x "$INIT_CMD" ]; then
+	if "$INIT_CMD" enabled >/dev/null 2>&1; then
+		enabled=1
+	fi
+	if "$INIT_CMD" running >/dev/null 2>&1; then
+		running=1
+	fi
+fi
+
+tmp="$(mktemp "$STATE_DIR/.package-service-state.XXXXXX")"
+printf 'enabled=%s\nrunning=%s\n' "$enabled" "$running" > "$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$STATE_FILE"
+
+if [ -x "$INIT_CMD" ]; then
+	"$INIT_CMD" stop >/dev/null 2>&1
+	"$INIT_CMD" disable >/dev/null 2>&1
+fi
+exit 0
